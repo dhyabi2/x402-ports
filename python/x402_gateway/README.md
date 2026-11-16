@@ -64,8 +64,34 @@ Django on ASGI: wrap `get_asgi_application()` with `x402_gateway.asgi.X402Middle
 | `page` | built in | `(ctx) -> html` |
 | `contact` | | mailto: or URL for bulk deals |
 | `on_sale` | | `(sale) -> None`, for accounting |
+| `nano` | off | `{"pay_to": "nano_…", "rate": …, "rpc_url": …, "claims": …}`: also offer XNO on network `nano`, checked on your own Nano node. See below |
 
 Without `coinpay_api_key` and `pay_to` the gateway still answers training crawlers with 402 and the page says payments are off.
+
+## XNO checked by your own node (opt-in)
+
+The reference's `nano` option, in its own-node form. With it set, the offer gets one more entry, last: `scheme: "exact"`, `network: "nano"`, `asset: "XNO"`, the amount in raw (10^30 per XNO, rounded up from `price_cents` at `rate`, the price of 1 XNO in `currency`, a number or a callable read per offer). Without it the offer and every other path are exactly as before.
+
+```python
+from x402_gateway import Gateway, FileClaims
+
+gateway = Gateway(
+    "https://your-site.com",
+    coinpay_api_key=os.environ["COINPAY_X402_KEY"],
+    pay_to=os.environ["CRAWL_PAY_TO"],
+    nano={
+        "pay_to": "nano_…",
+        "rate": 0.8,
+        "rpc_url": "https://your-node.example/rpc",   # https, or http on localhost
+        "claims": FileClaims("/var/lib/x402-gateway/nano-claims.log"),
+    },
+)
+```
+
+- **Bound to the order** ([xno-binding v1](https://github.com/dhyabi2/xno-call-binding/blob/main/docs/BINDING-STANDARD.md), option C). The entry's `extra` carries `binding: "xno-binding/v1/rep"` and a random `orderId`. The payer signs its send with `representative` set to the account encoding of `SHA-256("xno-binding/v1/rep|" + orderId + "|" + payTo + "|" + amountRaw)` (`order_representative()` computes it), and presents `payload.orderId` with `payload.blockHash`. A block hash without the order id it was signed for is refused.
+- **Exact.** The gateway reads the block with `block_info` (no key, no seed) and requires a confirmed send to `pay_to` of exactly the offered raw amount for the days paid. CoinPay is not asked about Nano proofs.
+- **Once, across restarts.** Each block hash and each order id is credited once; `FileClaims` appends and fsyncs every claim and reads the file back on start (one process per file). The same block with the same order id again gets back a pass that ends where the first one did.
+- The payee's checksum is checked, and an `xrb_` payee is written as `nano_`. A `nano` setting without `rpc_url` and `claims` is refused at start: this port does not take the CoinPay-only form.
 
 ## Test
 
