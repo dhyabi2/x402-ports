@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlsplit
 
+from .nano import BINDING, nano_payee, new_order_id, normalise_nano, settle_nano, xno_raw
+
 # --------------------------------------------------------------- agents --
 
 #: Training-only crawlers: refused in robots.txt, charged by the gateway.
@@ -75,11 +77,37 @@ def build_offer(
     description: str = "Payment required",
     max_timeout_seconds: int = 300,
     methods: Sequence[Mapping[str, str]] = METHODS,
+    nano: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """A v2 402 body. ``amount`` is the price in the token's smallest unit, rounded up."""
+    """A v2 402 body. ``amount`` is the price in the token's smallest unit, rounded up.
+
+    ``nano`` (``{"pay_to", "amount", "binding"}``) adds an XNO entry last, and
+    only with a checksum-valid Nano payee and a raw amount: without both the
+    offer is exactly the USDC one. With ``binding`` the entry carries the
+    xno-binding v1 marker and a fresh random order id.
+    """
     if not pay_to:
         raise ValueError("an offer needs a payTo address")
     amount = str(math.ceil((float(price_cents) / 100) * 10**_DECIMALS))
+    nano = nano or {}
+    xno_to = nano_payee(nano.get("pay_to"))
+    xno_amount = str(nano.get("amount") or "")
+    xno: List[Dict[str, Any]] = []
+    if xno_to and _RAW.match(xno_amount):
+        xno.append(
+            {
+                "scheme": "exact",
+                "network": "nano",
+                "amount": xno_amount,
+                "asset": "XNO",
+                "payTo": xno_to,
+                "resource": resource,
+                "description": description,
+                "mimeType": "application/json",
+                "maxTimeoutSeconds": max_timeout_seconds,
+                "extra": {"decimals": 30, "binding": BINDING, "orderId": new_order_id()} if nano.get("binding") else {"decimals": 30},
+            }
+        )
     return {
         "x402Version": 2,
         "accepts": [
@@ -96,10 +124,12 @@ def build_offer(
                 "extra": dict(_DOMAIN),
             }
             for m in methods
-        ],
+        ]
+        + xno,
     }
 
 
+_RAW = re.compile(r"^[1-9][0-9]*$")
 _B64_OK = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
 
 
@@ -122,7 +152,31 @@ def decode_payment(header: Optional[str]) -> Optional[Any]:
         parsed = json.loads(_from_base64(header))
     except (ValueError, binascii.Error, UnicodeDecodeError):
         return None
-    return parsed if isinstance(parsed, (dict, list)) else None
+    if isinstance(parsed, dict):
+        return _lift_nano(parsed)
+    return parsed if isinstance(parsed, list) else None
+
+
+def _lift_nano(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """A Nano proof is a block hash and an order id, not an EIP-3009
+    authorization. ``network``, ``blockHash``, ``orderId`` and ``amount`` are
+    lifted into the payload from wherever this payer put them (the top level,
+    or the ``accepted`` entry it chose). Every other proof is returned as is."""
+    chosen = parsed.get("accepted") if isinstance(parsed.get("accepted"), dict) else {}
+    payload = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else {}
+    network = str(parsed.get("network") or payload.get("network") or chosen.get("network") or "").lower()
+    if network != "nano":
+        return parsed
+    payload = dict(payload)
+    payload["network"] = "nano"
+    for key in ("blockHash", "orderId"):
+        if not payload.get(key) and parsed.get(key):
+            payload[key] = parsed[key]
+    if not payload.get("to") and chosen.get("payTo"):
+        payload["to"] = chosen["payTo"]
+    if payload.get("amount") is None and chosen.get("amount"):
+        payload["amount"] = str(chosen["amount"])
+    return {**parsed, "network": "nano", "payload": payload}
 
 
 def expected_for(payment: Any, offer: Mapping[str, Any]) -> Optional[Dict[str, str]]:
@@ -130,6 +184,9 @@ def expected_for(payment: Any, offer: Mapping[str, Any]) -> Optional[Dict[str, s
     network = str(_get(payment, "network") or "").lower()
     for a in offer.get("accepts") or []:
         if str(a["network"]).lower() == network:
+            if network == "nano":
+                # XNO is Nano's native coin: the block, not an asset field, proves the payment.
+                return {"amount": a["amount"], "resource": a["resource"], "payTo": a["payTo"]}
             return {"amount": a["amount"], "resource": a["resource"], "payTo": a["payTo"], "asset": a["asset"]}
     return None
 
@@ -143,10 +200,14 @@ def _get(obj: Any, *path: str) -> Any:
 
 
 def nonce_of(payment: Any) -> Optional[str]:
-    return _get(payment, "payload", "authorization", "nonce")
+    """The single-use nonce: a Nano proof's is its block hash."""
+    return _get(payment, "payload", "authorization", "nonce") or _get(payment, "payload", "blockHash")
 
 
 def valid_before_of(payment: Any) -> Optional[int]:
+    """When the payer's signature stops being valid. None for Nano, which signs nothing with a deadline."""
+    if str(_get(payment, "network") or "").lower() == "nano":
+        return None
     raw = _get(payment, "payload", "authorization", "validBefore")
     try:
         v = float(raw)
@@ -179,6 +240,9 @@ def _bigint(raw: Any) -> Optional[int]:
 def paid_value_of(payment: Any) -> Optional[int]:
     """The value a proof authorizes, in the token's smallest unit, or None."""
     raw = _get(payment, "payload", "authorization", "value")
+    if raw is None and _get(payment, "network") == "nano":
+        # A Nano proof states its amount in raw; the block is then held to the offer.
+        raw = _get(payment, "payload", "amount")
     if raw is None or raw == "":
         return None
     v = _bigint(raw)
@@ -491,6 +555,10 @@ class Gateway:
     :param page: ``(ctx) -> html``, a custom sales page
     :param contact: mailto: or URL for bulk deals
     :param on_sale: ``(sale_dict) -> None``, accounting hook; an exception here never costs a buyer the pass
+    :param nano: opt-in XNO, ``{"pay_to": "nano_…", "rate": …, "rpc_url": …, "claims": …}``: a checksum-valid
+        payee, the price of 1 XNO in ``currency`` (a number or a callable), the operator's own Nano node (https,
+        or http on localhost) and a claims store that survives restarts (:class:`x402_gateway.nano.FileClaims`).
+        Proofs are read from that node, must be bound to the order (xno-binding v1) and are credited once
     :param post: ``(url, headers, body) -> (status, text)``, for tests
     :param now: ``() -> int`` unix seconds, for tests
     """
@@ -520,6 +588,7 @@ class Gateway:
         page: Optional[Callable[[Dict[str, Any]], str]] = None,
         contact: str = "",
         on_sale: Optional[Callable[[Dict[str, Any]], None]] = None,
+        nano: Optional[Mapping[str, Any]] = None,
         post: Poster = _urllib_post,
         now: Callable[[], int] = lambda: int(time.time()),
     ) -> None:
@@ -546,6 +615,7 @@ class Gateway:
         self.is_paid_agent = is_paid_agent or (lambda ua: is_training_agent(ua, self.training))
         self.contact = contact or ""
         self.on_sale = on_sale
+        self.nano = normalise_nano(nano)
         self.post = post
         self.now = now
         if page is None:
@@ -579,6 +649,22 @@ class Gateway:
             return 1
         return min(n, self.max_days)
 
+    def _nano_for(self, days: int) -> Optional[Dict[str, Any]]:
+        """The XNO entry's payee and raw amount for ``days`` terms, or None.
+        ``days`` times one term's raw, never the raw of ``days`` times the
+        price, so a proof for N terms is an exact multiple of one term."""
+        if not self.nano:
+            return None
+        rate = self.nano["rate"]
+        try:
+            rate = rate() if callable(rate) else rate
+        except Exception:  # noqa: BLE001 - no rate, no XNO entry
+            return None
+        raw = xno_raw(self.price_cents, rate)
+        if raw is None:
+            return None
+        return {"pay_to": self.nano["pay_to"], "amount": str(int(raw) * days), "binding": True}
+
     def offer(self, days: int = 1) -> Dict[str, Any]:
         """The offer for ``days`` terms: the same entries, ``days`` times the price."""
         if not self.enabled:
@@ -589,6 +675,7 @@ class Gateway:
             price_cents=self.price_cents * days,
             resource=self.buy_url,
             description=f"{days * self.pass_minutes} minutes of crawl access to {self.site_url}{extra}",
+            nano=self._nano_for(days),
         )
 
     def receipt(self, days: int = 1, **extra: Any) -> Dict[str, Any]:
@@ -679,12 +766,26 @@ class Gateway:
             expected = expected_for(payment, self.offer(days)) or unit
             term = days * self.pass_minutes * 60
             now = int(self.now())
-            result = verify_and_settle(payment, expected, self.coinpay_api_key, self.coinpay_base_url, self.post)
+            # A Nano proof is read on the operator's own node and claimed here; CoinPay is not asked.
+            direct = bool(self.nano) and str(payment.get("network") or "").lower() == "nano"
+            if direct:
+                # Held to exactly `days` times the per-term raw the days were counted from, so a rate
+                # read that fails or moves between the two offers can never sell N terms for one.
+                held = {"amount": str(days * int(unit["amount"])), "payTo": unit["payTo"]}
+                result = settle_nano(payment, held, self.nano["rpc_url"], self.nano["claims"], self.post, lambda: now)
+            else:
+                result = verify_and_settle(payment, expected, self.coinpay_api_key, self.coinpay_base_url, self.post)
 
             expires_at: Optional[int] = None
             replayed = False
             if result["ok"]:
                 expires_at = now + term
+            elif result.get("replay") and direct:
+                # The same block for the same order again: the payer lost our answer.
+                # The pass it gets back ends where the first one did.
+                if isinstance(result.get("claimedAt"), int):
+                    expires_at = result["claimedAt"] + term
+                    replayed = True
             elif result.get("replay"):
                 paid = settle_again(payment, self.coinpay_api_key, self.coinpay_base_url, self.post)
                 valid_before = valid_before_of(payment)
