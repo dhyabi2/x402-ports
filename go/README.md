@@ -26,7 +26,34 @@ http.ListenAndServe(":8080", gw.Middleware(mux))
 
 ## Options
 
-Same names as the reference, in Go casing: `PriceCents` (100), `PassMinutes` (1440), `MaxDays` (30), `Header` (`x-crawl-pass`), `Path` (`/crawl`), `OpenPaths`, `IsPaidAgent`, `DenyCIDRs`, `ChargeSpoofedBrowsers`, `Exempt func(*http.Request) bool`, `Secret`, `Page`, `Contact`, `OnSale`, `HTTPClient`. Without `CoinPayAPIKey` and `PayTo` the gateway still answers training crawlers with 402 and the page says payments are off.
+Same names as the reference, in Go casing: `PriceCents` (100), `PassMinutes` (1440), `MaxDays` (30), `Header` (`x-crawl-pass`), `Path` (`/crawl`), `OpenPaths`, `IsPaidAgent`, `DenyCIDRs`, `ChargeSpoofedBrowsers`, `Exempt func(*http.Request) bool`, `Secret`, `Page`, `Contact`, `OnSale`, `HTTPClient`, `Nano` (off; see below). Without `CoinPayAPIKey` and `PayTo` the gateway still answers training crawlers with 402 and the page says payments are off.
+
+## XNO checked by your own node (opt-in)
+
+The reference's `nano` option in its own-node form, as the Python port has it. With `Nano` set, the offer gets one more entry, last: `scheme: "exact"`, `network: "nano"`, `asset: "XNO"`, the amount in raw (10^30 per XNO, rounded up from `PriceCents` at `Rate`, the price of 1 XNO in `Currency`; or `RateFunc`, read per offer). Without it the offer and every other path are exactly as before.
+
+```go
+claims, err := x402gateway.NewFileClaims("/var/lib/x402-gateway/nano-claims.log")
+if err != nil {
+	log.Fatal(err)
+}
+gw, err := x402gateway.New(x402gateway.Options{
+	SiteURL:       "https://your-site.com",
+	CoinPayAPIKey: os.Getenv("COINPAY_X402_KEY"),
+	PayTo:         os.Getenv("CRAWL_PAY_TO"),
+	Nano: &x402gateway.NanoOptions{
+		PayTo:  "nano_…",
+		Rate:   0.8,
+		RPCURL: "https://your-node.example/rpc", // https, or http on localhost
+		Claims: claims,
+	},
+})
+```
+
+- **Bound to the order** ([xno-binding v1](https://github.com/dhyabi2/xno-call-binding/blob/main/docs/BINDING-STANDARD.md), option C). The entry's `extra` carries `binding: "xno-binding/v1/rep"` and a random `orderId`. The payer signs its send with `representative` set to the account encoding of `SHA-256("xno-binding/v1/rep|" + orderId + "|" + payTo + "|" + amountRaw)` (`OrderRepresentative()` computes it), and presents `payload.orderId` with `payload.blockHash`. A block hash without the order id it was signed for is refused.
+- **Exact.** The gateway reads the block with `block_info` (no key, no seed) and requires a confirmed send to `PayTo` of exactly the offered raw amount for the days paid. CoinPay is not asked about Nano proofs.
+- **Once, across restarts.** Each block hash and each order id is credited once; `FileClaims` appends and fsyncs every claim and reads the file back on start (one process per file). The same block with the same order id again gets back a pass that ends where the first one did. Any `NanoClaims` backed by a table with both columns UNIQUE works too.
+- The payee's checksum is checked, and an `xrb_` payee is written as `nano_`. `Nano` without `RPCURL` and `Claims` is refused by `New`. Standard library only: the address checksum uses a small BLAKE2b in `nano.go`.
 
 ## coinpay launcher
 

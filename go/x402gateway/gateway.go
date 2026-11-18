@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -38,8 +39,13 @@ type Options struct {
 	Page                  func(PageContext) string
 	Contact               string
 	OnSale                func(Sale)
-	HTTPClient            *http.Client
-	Now                   func() int64 // unix seconds, for tests
+	// Nano is opt-in XNO: a checksum-valid payee, the price of 1 XNO in Currency, the
+	// operator's own Nano node (https, or http on localhost) and a claims store that
+	// survives restarts (NewFileClaims). Proofs are read from that node, must be bound
+	// to the order (xno-binding v1) and are credited once. Nil leaves everything as it was.
+	Nano       *NanoOptions
+	HTTPClient *http.Client
+	Now        func() int64 // unix seconds, for tests
 }
 
 // Sale is what OnSale receives.
@@ -71,6 +77,7 @@ type Gateway struct {
 	denied  []CIDR
 	buyURL  string
 	coinpay CoinPay
+	nano    *nanoConfig
 }
 
 // New builds a Gateway.
@@ -128,7 +135,11 @@ func New(o Options) (*Gateway, error) {
 	if o.HTTPClient == nil {
 		o.HTTPClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	g := &Gateway{o: o}
+	nano, err := normaliseNano(o.Nano)
+	if err != nil {
+		return nil, err
+	}
+	g := &Gateway{o: o, nano: nano}
 	g.Enabled = o.CoinPayAPIKey != "" && o.PayTo != ""
 	g.secret = o.Secret
 	if g.secret == "" {
@@ -190,8 +201,34 @@ func (g *Gateway) Offer(days int) Offer {
 	o, _ := BuildOffer(OfferOptions{
 		PayTo: g.o.PayTo, PriceCents: g.o.PriceCents * float64(days), Resource: g.buyURL,
 		Description: fmt.Sprintf("%d minutes of crawl access to %s%s", days*g.o.PassMinutes, g.o.SiteURL, extra),
+		Nano:        g.nanoFor(days),
 	})
 	return o
+}
+
+// nanoFor is the XNO entry for days terms, or nil. days times one term's raw, never
+// the raw of days times the price, so a proof for N terms is an exact multiple of one term.
+func (g *Gateway) nanoFor(days int) *NanoEntry {
+	if g.nano == nil {
+		return nil
+	}
+	rate, err := func() (r float64, err error) {
+		defer func() {
+			if recover() != nil {
+				err = errors.New("rate panicked")
+			}
+		}()
+		return g.nano.rate()
+	}()
+	if err != nil {
+		return nil // no rate, no XNO entry
+	}
+	raw := XNORaw(g.o.PriceCents, rate)
+	if raw == "" {
+		return nil
+	}
+	one, _ := new(big.Int).SetString(raw, 10)
+	return &NanoEntry{PayTo: g.nano.payTo, Amount: new(big.Int).Mul(one, big.NewInt(int64(days))).String(), Binding: true}
 }
 
 // PassInfo is the human half of a 402 body.
@@ -328,12 +365,32 @@ func (g *Gateway) Sell(r *http.Request) *Answer {
 		}
 		term := int64(days) * int64(g.o.PassMinutes) * 60
 		now := g.o.Now()
-		result := g.coinpay.VerifyAndSettle(r.Context(), payment, *expected)
+		// A Nano proof is read on the operator's own node and claimed here; CoinPay is not asked.
+		direct := g.nano != nil && strings.ToLower(str(get(payment, "network"))) == "nano"
+		var result Settlement
+		if direct {
+			// Held to exactly days times the per-term raw the days were counted from, so a rate
+			// read that fails or moves between the two offers can never sell N terms for one.
+			held := Expected{PayTo: unit.PayTo}
+			if per := bigInt(unit.Amount); per != nil {
+				held.Amount = new(big.Int).Mul(per, big.NewInt(int64(days))).String()
+			}
+			result = SettleNano(r.Context(), g.o.HTTPClient, payment, held, g.nano.rpcURL, g.nano.claims, now)
+		} else {
+			result = g.coinpay.VerifyAndSettle(r.Context(), payment, *expected)
+		}
 
 		var expiresAt int64
 		replayed := false
 		if result.OK {
 			expiresAt = now + term
+		} else if result.Replay && direct {
+			// The same block for the same order again: the payer lost our answer.
+			// The pass it gets back ends where the first one did.
+			if result.ClaimedAt > 0 {
+				expiresAt = result.ClaimedAt + term
+				replayed = true
+			}
 		} else if result.Replay {
 			paid := g.coinpay.SettleAgain(r.Context(), payment)
 			validBefore := ValidBeforeOf(payment)

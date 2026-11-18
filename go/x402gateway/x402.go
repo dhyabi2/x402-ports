@@ -33,10 +33,15 @@ var Methods = []Method{
 
 const decimals = 6
 
-// Domain is the token's EIP-712 domain, the same for all three USDC deployments.
+// Domain is an entry's extra: the token's EIP-712 domain, the same for all three USDC
+// deployments. A Nano entry carries Decimals (30) instead, and with the order binding
+// also Binding and OrderID; those stay empty, and unwritten, on every USDC entry.
 type Domain struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
+	Name     string `json:"name,omitempty"`
+	Version  string `json:"version,omitempty"`
+	Decimals int    `json:"decimals,omitempty"`
+	Binding  string `json:"binding,omitempty"`
+	OrderID  string `json:"orderId,omitempty"`
 }
 
 // Accept is one entry of an x402 v2 offer.
@@ -67,6 +72,15 @@ type OfferOptions struct {
 	Description       string
 	MaxTimeoutSeconds int // default 300
 	Methods           []Method
+	Nano              *NanoEntry // adds an XNO entry last; nil leaves the offer as it was
+}
+
+// NanoEntry is the XNO entry of an offer: a checksum-valid payee and an amount in raw.
+// With Binding the entry carries the xno-binding v1 marker and a fresh random order id.
+type NanoEntry struct {
+	PayTo   string
+	Amount  string
+	Binding bool
 }
 
 // BuildOffer builds a v2 402 body. Amount is the price in the token's smallest unit, rounded up.
@@ -89,8 +103,22 @@ func BuildOffer(o OfferOptions) (Offer, error) {
 		out.Accepts = append(out.Accepts, Accept{
 			Scheme: "exact", Network: m.Network, Amount: amount, Asset: m.Asset, PayTo: o.PayTo,
 			Resource: o.Resource, Description: o.Description, MimeType: "application/json",
-			MaxTimeoutSeconds: o.MaxTimeoutSeconds, Extra: Domain{"USD Coin", "2"},
+			MaxTimeoutSeconds: o.MaxTimeoutSeconds, Extra: Domain{Name: "USD Coin", Version: "2"},
 		})
+	}
+	// Only with a checksum-valid Nano payee and a raw amount: without both the offer is exactly the USDC one.
+	if o.Nano != nil {
+		if to := NanoPayee(o.Nano.PayTo); to != "" && rawRe.MatchString(o.Nano.Amount) {
+			extra := Domain{Decimals: 30}
+			if o.Nano.Binding {
+				extra.Binding, extra.OrderID = NanoBinding, NewOrderID()
+			}
+			out.Accepts = append(out.Accepts, Accept{
+				Scheme: "exact", Network: "nano", Amount: o.Nano.Amount, Asset: "XNO", PayTo: to,
+				Resource: o.Resource, Description: o.Description, MimeType: "application/json",
+				MaxTimeoutSeconds: o.MaxTimeoutSeconds, Extra: extra,
+			})
+		}
 	}
 	return out, nil
 }
@@ -124,11 +152,55 @@ func DecodePayment(header string) any {
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return nil
 	}
-	switch v.(type) {
-	case map[string]any, []any:
+	switch t := v.(type) {
+	case map[string]any:
+		return liftNano(t)
+	case []any:
 		return v
 	}
 	return nil
+}
+
+// liftNano: a Nano proof is a block hash and an order id, not an EIP-3009 authorization.
+// network, blockHash, orderId and amount are lifted into the payload from wherever this
+// payer put them (the top level, or the accepted entry it chose). Every other proof is
+// returned as is.
+func liftNano(parsed map[string]any) map[string]any {
+	chosen, _ := parsed["accepted"].(map[string]any)
+	payload, _ := parsed["payload"].(map[string]any)
+	network := str(parsed["network"])
+	if network == "" {
+		network = str(payload["network"])
+	}
+	if network == "" {
+		network = str(chosen["network"])
+	}
+	if strings.ToLower(network) != "nano" {
+		return parsed
+	}
+	lifted := map[string]any{}
+	for k, v := range payload {
+		lifted[k] = v
+	}
+	lifted["network"] = "nano"
+	for _, k := range []string{"blockHash", "orderId"} {
+		if !truthy(lifted[k]) && truthy(parsed[k]) {
+			lifted[k] = parsed[k]
+		}
+	}
+	if !truthy(lifted["to"]) && truthy(chosen["payTo"]) {
+		lifted["to"] = chosen["payTo"]
+	}
+	if lifted["amount"] == nil && truthy(chosen["amount"]) {
+		lifted["amount"] = str(chosen["amount"])
+	}
+	out := map[string]any{}
+	for k, v := range parsed {
+		out[k] = v
+	}
+	out["network"] = "nano"
+	out["payload"] = lifted
+	return out
 }
 
 // Expected is what CoinPay must hold a proof to, taken from the offered entry for its network.
@@ -173,17 +245,30 @@ func ExpectedFor(payment any, offer Offer) *Expected {
 	network := strings.ToLower(str(get(payment, "network")))
 	for _, a := range offer.Accepts {
 		if strings.ToLower(a.Network) == network {
+			if network == "nano" {
+				// XNO is Nano's native coin: the block, not an asset field, proves the payment.
+				return &Expected{Amount: a.Amount, Resource: a.Resource, PayTo: a.PayTo}
+			}
 			return &Expected{a.Amount, a.Resource, a.PayTo, a.Asset}
 		}
 	}
 	return nil
 }
 
-// NonceOf is the single-use nonce CoinPay keys replay detection on.
-func NonceOf(payment any) string { return str(get(payment, "payload", "authorization", "nonce")) }
+// NonceOf is the single-use nonce CoinPay keys replay detection on. A Nano proof's is its block hash.
+func NonceOf(payment any) string {
+	if n := str(get(payment, "payload", "authorization", "nonce")); n != "" {
+		return n
+	}
+	return str(get(payment, "payload", "blockHash"))
+}
 
 // ValidBeforeOf is when the payer's signature stops being valid, unix seconds; 0 if unreadable.
+// 0 for Nano, which signs nothing with a deadline.
 func ValidBeforeOf(payment any) int64 {
+	if strings.ToLower(str(get(payment, "network"))) == "nano" {
+		return 0
+	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(str(get(payment, "payload", "authorization", "validBefore"))), 64)
 	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) || f <= 0 {
 		return 0
@@ -221,6 +306,10 @@ func bigInt(raw any) *big.Int {
 // PaidValueOf is the value a proof authorizes, in the token's smallest unit, or nil.
 func PaidValueOf(payment any) *big.Int {
 	raw := get(payment, "payload", "authorization", "value")
+	if raw == nil && str(get(payment, "network")) == "nano" {
+		// A Nano proof states its amount in raw; the block is then held to the offer.
+		raw = get(payment, "payload", "amount")
+	}
 	if raw == nil || raw == "" {
 		return nil
 	}
@@ -288,6 +377,8 @@ type Settlement struct {
 	Ref    string
 	Reason string
 	Replay bool
+	// ClaimedAt is when a Nano block was first claimed, unix seconds, on a Replay by the same order.
+	ClaimedAt int64
 }
 
 var replayVerify = regexp.MustCompile(`(?i)already used|replay`)
